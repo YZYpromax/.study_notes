@@ -176,6 +176,8 @@ nvprof——>**Nsigaht compute**(ncu)[系统级性能分析，可视化 CPU/GPU 
 
 和**Nsight systems**(nsys)[系统级性能分析，可视化 CPU/GPU 活动、内存传输、API 调用等]
 
+在windows下 文件所在位置：`C:\Program Files\NVIDIA Corporation`
+
 ## 并行线程组织模式
 
 以线程为基本单位，为每个线程编号。(ix,iy)全局地址

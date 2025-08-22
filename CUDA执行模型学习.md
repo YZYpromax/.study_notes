@@ -131,13 +131,14 @@ if(argc<INT_MIN||ARGC>INT_MAX)//输出检查
 
 常用指标对照
 
-| achieved_occupancy | sm__warps_active.avg.pct_of_peak_sustained_active             |
-| ------------------ | ------------------------------------------------------------- |
-| gld_throughput     | l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum.per_second       |
-| gst_throughput     | l1tex__t_bytes_pipe_lsu_mem_global_op_st.sum.per_second       |
-| gld_efficiency     | smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct |
-| shared_efficiency  | smsp__sass_average_data_bytes_per_wavefront_mem_shared.pct    |
-| branch_efficiency  | smsp__sass_thread_inst_executed_op_control_pred_on.sum        |
+| achieved_occupancy | sm__warps_active.avg.pct_of_peak_sustained_active                    |
+| ------------------ | -------------------------------------------------------------------- |
+| gld_throughput     | l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum 并不完全一致          |
+| gst_throughput     | l1tex__t_bytes_pipe_lsu_mem_global_op_st.sum.per_second              |
+| gld_efficiency     | smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct        |
+| shared_efficiency  | smsp__sass_average_data_bytes_per_wavefront_mem_shared.pct           |
+| branch_efficiency  | smsp__sass_thread_inst_executed_op_control_pred_on.sum               |
+| inst_per_warp      | ncu --metrics  smsp__average_inst_executed_per_warp ./reduceInteger |
 
 多因一效
 
@@ -151,10 +152,49 @@ if(argc<INT_MIN||ARGC>INT_MAX)//输出检查
 
 ![1755595159859](image/CUDA执行模型学习/1755595159859.png)
 
-相邻配对线程分析
+#### 相邻配对线程分析
 
 ![1755597205093](image/CUDA执行模型学习/1755597205093.png)
 
 上图每一层的线程都是并行的，但是同一层中的线程计算也是有快有慢 为了保证 下一层的输入能够准确传入，需要强制同步，避免块内线程竞争内存
 
 被操作的两个对象之间的距离叫做跨度，一般记为stride
+
+```
+$\frac(tion){1}{2}$//  1/2
+```
+
+初始代码优化过程的理解：
+
+```
+for (int stride = 1; stride < blockDim.x; stride *= 2)
+	{
+		if ((tid % (2 * stride)) == 0)
+		{
+			idata[tid] += idata[tid + stride];
+		}
+		//synchronize within block
+		__syncthreads();
+	}
+```
+
+上述代码中， 直接选择偶数线程进行数据的处理，导致其中的奇数线程闲置等待，资源浪费。可以发现该方式直接利用线程编号tid作为数组的索引，导致线程分化。为此提出了第二种方式，index = 2 * stride *tid  。
+
+```
+for (int stride = 1; stride < blockDim.x; stride *= 2)
+	{
+		//convert tid into local array index
+		int index = 2 * stride *tid;
+		if (index < blockDim.x)
+		{
+			idata[index] += idata[index + stride];
+		}
+		__syncthreads();
+	}
+```
+
+该方法通过第一种方法转换而来，(tid % (2 * stride)==0——> tid=2*stride *k,此处的k 随着tid 的变化  连续增长0.1.2.3...   将k换做  tid , tid替换成 index  即index = 2 * stride *tid，则idata[tid]==idata[index],  由此，将直接用tid编号的数组换为了 tid 映射的index编号，保证了线程数据计算方式不变，但是线程分配由偶数线程到 连续线程的转换，优化了线程的分支发散。
+
+#### 交错配对 
+
+通过对stride的修改，`（stride=blockDim.x/2)`,也能够将线程的启用 `(idata[tid]=idata[tid]+idata[tid+stride])`集中在线程束的前一部分。
