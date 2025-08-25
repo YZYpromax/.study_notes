@@ -195,6 +195,175 @@ for (int stride = 1; stride < blockDim.x; stride *= 2)
 
 该方法通过第一种方法转换而来，(tid % (2 * stride)==0——> tid=2*stride *k,此处的k 随着tid 的变化  连续增长0.1.2.3...   将k换做  tid , tid替换成 index  即index = 2 * stride *tid，则idata[tid]==idata[index],  由此，将直接用tid编号的数组换为了 tid 映射的index编号，保证了线程数据计算方式不变，但是线程分配由偶数线程到 连续线程的转换，优化了线程的分支发散。
 
-#### 交错配对 
+#### 交错配对
 
 通过对stride的修改，`（stride=blockDim.x/2)`,也能够将线程的启用 `(idata[tid]=idata[tid]+idata[tid+stride])`集中在线程束的前一部分。
+
+## 循环展开
+
+一个尝试通过减少分支出现的频率和循环维护指令来优化循环的技术
+
+```
+for(i=0;i<=100;i++){
+	a[i]=b[i]+c[i];
+}
+```
+
+手动展开循环：
+
+```
+for(i=0;i<=100;i+=4){
+	a[i]=b[i]+c[i];
+	a[i+1]=b[i+1]+c[i+1];
+	a[i+2]=b[i+2]+c[i+2];
+	a[i+3]=b[i+3]+c[i+3];
+}
+```
+
+### 归约初步展开
+
+```
+g_idata[idx]+=g_idata[idx+blockDim.x*2*stride]
+```
+
+将相邻的单位数据块逻辑上合并为一个大的数据块，通过提前对两个相邻的数据块相加处理，得到一个单位大小不变，数值变化的单位大小数据块，对整个数据块做同样的操作，得到多个处理后的合并数据块。此时这些合并后的数据块，只有前半部分的线程是有用数据，只处理前半部分数据，即这个单位大小的数据块，初始跨度为 `blockDim.x/2`, 之后 `stride>>1`，进行交错配对归并。第一步合并，减少了一半的数据块循环，以及块内的归并计算。
+
+![1755966336037](image/CUDA执行模型学习/1755966336037.png)
+
+### 完全展开的归约
+
+下述代码区别于上述初步的展开，在数据归约前，对数据划分进行相加的预处理，在归约过程中也加入了循环展开的优化。
+
+```
+__global__ void reduceUnrollWarp8(int * g_idata,int * g_odata,unsigned int n)
+{
+	//set thread ID
+	unsigned int tid = threadIdx.x;
+	unsigned int idx = blockDim.x*blockIdx.x*8+threadIdx.x;
+	//boundary check
+	if (tid >= n) return;
+	//convert global data pointer to the
+	int *idata = g_idata + blockIdx.x*blockDim.x*8;
+	//unrolling 8;
+	if(idx+7 * blockDim.x<n)
+	{
+		int a1=g_idata[idx];
+		int a2=g_idata[idx+blockDim.x];
+		int a3=g_idata[idx+2*blockDim.x];
+		int a4=g_idata[idx+3*blockDim.x];
+		int a5=g_idata[idx+4*blockDim.x];
+		int a6=g_idata[idx+5*blockDim.x];
+		int a7=g_idata[idx+6*blockDim.x];
+		int a8=g_idata[idx+7*blockDim.x];
+		g_idata[idx]=a1+a2+a3+a4+a5+a6+a7+a8;
+
+	}
+	__syncthreads();
+	//in-place reduction in global memory
+	for (int stride = blockDim.x/2; stride>32; stride >>=1)
+	{
+		if (tid <stride)
+		{
+			idata[tid] += idata[tid + stride];
+		}
+		//synchronize within block
+		__syncthreads();
+	}
+	//write result for this block to global mem
+	if(tid<32)
+	{
+		volatile int *vmem = idata;
+		vmem[tid]+=vmem[tid+32];
+		vmem[tid]+=vmem[tid+16];
+		vmem[tid]+=vmem[tid+8];
+		vmem[tid]+=vmem[tid+4];
+		vmem[tid]+=vmem[tid+2];
+		vmem[tid]+=vmem[tid+1];
+
+	}
+
+	if (tid == 0)
+		g_odata[blockIdx.x] = idata[0];
+
+}
+```
+
+对上述所有代码的逻辑  ，主要分为三步，  首先通过对一个数据块内的特定位置的数相加  以此实现用一个线程块去处理，然后在这个线程块内 进行初步归约至最后32个线程块，然后再对32线程块的归约进行循环展开优化，得到最后的结果，多个数据块分别在对应的多个线程块上进行计算。
+
+![1756027343972](image/CUDA执行模型学习/1756027343972.png)
+
+warp同步执行
+
+```
+	if(tid<32)
+	{
+		volatile int *vmem = idata;
+		vmem[tid]+=vmem[tid+32];
+		vmem[tid]+=vmem[tid+16];
+		vmem[tid]+=vmem[tid+8];
+		vmem[tid]+=vmem[tid+4];
+		vmem[tid]+=vmem[tid+2];
+		vmem[tid]+=vmem[tid+1];
+
+	}
+```
+
+上述代码疑问：每个线程都在并行执行这段代码 那么会不会产生 其他线程读取更改后的数值，被某个线程读取继续计算，因为线程都是并行执行的 可能vmem[16]+=vmem[16+32]   然后在线程0执行这段代码时候，vmem[0]+=vmem[0+16]时，vmem[16]已经被更改？
+
+**第一步：所有线程同时执行 vmem[tid] += vmem[tid+32] ；第二步：所有线程同时执行 vmem[tid] += vmem[tid+16]**
+
+同一个warp内，所有线程同时执行相同的指令，每个指令都作为一个隐式的同步屏障。在所有线程完成当前指令之前，没有线程会开始执行下一条指令
+
+由于使用了 `volatile`关键字，强制vmem的读写必须在内存中进行，禁止了编译器的优化行为，所有内存写入都会立即变得对其他线程可见，而不是利用内存读取到寄存器中可能过期的缓存值
+
+warp内的线程不是真正"并行"执行多条不同指令，而是同步执行同一条指令（只是操作不同的数据）
+
+```
+(base) yzy@LAPTOP-6VTIDIPA:~/code/c++$ ./reduceUnrolling
+Using device 0: NVIDIA GeForce RTX 5070 Laptop GPU
+        with array size 16777216  grid 16384 block 1024 
+cpu sum:2139006520 
+cpu reduce                  elapsed 0.027207 ms cpu_sum: 2139006520
+gpu warmup                  elapsed 0.254142 ms 
+reduceUnrolling2            elapsed 0.000509 ms gpu_sum: 2139006520<<<grid 8192 block 1024>>>
+reduceUnrolling4            elapsed 0.000450 ms gpu_sum: 2139006520<<<grid 4096 block 1024>>>
+reduceUnrolling8            elapsed 0.000647 ms gpu_sum: 2139006520<<<grid 2048 block 1024>>>
+reduceUnrollingWarp8        elapsed 0.000343 ms gpu_sum: 2139006520<<<grid 2048 block 1024>>>
+reduceCompleteUnrollWarp8   elapsed 0.000346 ms gpu_sum: 2139006520<<<grid 2048 block 1024>>>
+reduceCompleteUnroll        elapsed 0.000371 ms gpu_sum: 2139006520<<<grid 2048 block 1024>>>
+
+(base) yzy@LAPTOP-6VTIDIPA:~/code/c++$ ./reduceUnrolling
+Using device 0: NVIDIA GeForce RTX 5070 Laptop GPU
+        with array size 16777216  grid 16384 block 1024 
+cpu sum:2139148312 
+cpu reduce                  elapsed 0.026057 ms cpu_sum: 2139148312
+gpu warmup                  elapsed 0.008614 ms 
+reduceUnrolling2            elapsed 0.000396 ms gpu_sum: 2139148312<<<grid 8192 block 1024>>>
+reduceUnrolling4            elapsed 0.000384 ms gpu_sum: 2139148312<<<grid 4096 block 1024>>>
+reduceUnrolling8            elapsed 0.000366 ms gpu_sum: 2139148312<<<grid 2048 block 1024>>>
+reduceUnrollingWarp8        elapsed 0.000350 ms gpu_sum: 2139148312<<<grid 2048 block 1024>>>
+reduceCompleteUnrollWarp8   elapsed 0.000336 ms gpu_sum: 2139148312<<<grid 2048 block 1024>>>
+reduceCompleteUnroll        elapsed 0.000343 ms gpu_sum: 2139148312<<<grid 2048 block 1024>>>
+
+(base) yzy@LAPTOP-6VTIDIPA:~/code/c++$ ./reduceUnrolling
+Using device 0: NVIDIA GeForce RTX 5070 Laptop GPU
+        with array size 16777216  grid 16384 block 1024 
+cpu sum:2139333888 
+cpu reduce                  elapsed 0.025430 ms cpu_sum: 2139333888
+gpu warmup                  elapsed 0.001927 ms 
+reduceUnrolling2            elapsed 0.000500 ms gpu_sum: 2139333888<<<grid 8192 block 1024>>>
+reduceUnrolling4            elapsed 0.000640 ms gpu_sum: 2139333888<<<grid 4096 block 1024>>>
+reduceUnrolling8            elapsed 0.000440 ms gpu_sum: 2139333888<<<grid 2048 block 1024>>>
+reduceUnrollingWarp8        elapsed 0.000361 ms gpu_sum: 2139333888<<<grid 2048 block 1024>>>
+reduceCompleteUnrollWarp8   elapsed 0.000367 ms gpu_sum: 2139333888<<<grid 2048 block 1024>>>
+reduceCompleteUnroll        elapsed 0.000312 ms gpu_sum: 2139333888<<<grid 2048 block 1024>>>
+
+```
+
+数据对比还是有出入的
+
+### Reducing with Template Functions
+
+`if(blockDim.x>=1024 && tid <512)`
+
+该设计使得同一段代码能够适配不同blockDim.x大小的线程块，无需编译不同版本
