@@ -89,7 +89,7 @@ little法则
 
 ## 并行性表现
 
-三元条件运算符： 条件？表达式1：表达式2  条件为真 返回式1 条件为假 返回式2
+### 三元条件运算符： 条件？表达式1：表达式2  条件为真 返回式1 条件为假 返回式2
 
 int dimx = argc>2? atoi(argv[1]):32
 
@@ -367,3 +367,116 @@ reduceCompleteUnroll        elapsed 0.000312 ms gpu_sum: 2139333888<<<grid 2048 
 `if(blockDim.x>=1024 && tid <512)`
 
 该设计使得同一段代码能够适配不同blockDim.x大小的线程块，无需编译不同版本
+
+## 动态并行
+
+类似于CPU串行程序的递归调用
+
+![1756111622432](image/CUDA执行模型学习/1756111622432.png)
+
+主机启动一个内核（网格），该父网格的线程在执行时，启动新的子网格，同一个线程块下的子网格执行是同步的，子网格在父网格结束前结束，子网格结束后，父网格才能结束。figure3-26是通过显式设置屏障的方式完成同步
+
+### 嵌套执行
+
+```
+#include <cuda_runtime.h>
+#include <stdio.h>
+__global__ void nesthelloworld(int iSize,int iDepth,int parentblockIdx)
+{
+    unsigned int tid=threadIdx.x;
+    printf("depth : %d blockIdx: %d,threadIdx: %d,parentblockIdx %d\n",iDepth,blockIdx.x,threadIdx.x,parentblockIdx);
+    if (iSize==1)
+        return;
+    int nthread=(iSize>>1);
+    if (tid==0 && nthread>0)
+    {
+        nesthelloworld<<<1,nthread>>>(nthread,++iDepth,blockIdx.x);
+        printf("-----------> nested execution depth: %d from parent block %d\n", iDepth, blockIdx.x);
+    }
+
+}
+
+int main(int argc,char* argv[])
+{
+    int size=64;
+    int block_x=2;
+    dim3 block(block_x,1);
+    dim3 grid((size-1)/block.x+1,1);
+    nesthelloworld<<<grid,block>>>(size,0,-1);
+    cudaGetLastError();
+    cudaDeviceReset();
+    return 0;
+}
+```
+
+执行代码输出：
+
+```
+depth : 0 blockIdx: 26,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 26,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 27,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 27,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 30,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 30,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 31,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 31,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 24,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 24,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 25,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 25,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 28,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 28,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 29,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 29,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 22,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 22,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 23,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 23,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 17,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 17,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 16,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 16,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 20,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 20,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 21,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 21,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 14,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 14,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 15,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 15,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 18,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 18,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 10,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 10,threadIdx: 1,parentblockIdx -1
+depth : 0 blockIdx: 19,threadIdx: 0,parentblockIdx -1
+depth : 0 blockIdx: 19,threadIdx: 1,parentblockIdx -1
+-----------> nested execution depth: 1 from parent block 20
+-----------> nested execution depth: 1 from parent block 21
+-----------> nested execution depth: 1 from parent block 15
+-----------> nested execution depth: 1 from parent block 14
+-----------> nested execution depth: 1 from parent block 18
+-----------> nested execution depth: 1 from parent block 19
+-----------> nested execution depth: 1 from parent block 12
+-----------> nested execution depth: 1 from parent block 13
+depth : 1 blockIdx: 0,threadIdx: 0,parentblockIdx 10
+depth : 1 blockIdx: 0,threadIdx: 1,parentblockIdx 10
+depth : 1 blockIdx: 0,threadIdx: 2,parentblockIdx 10
+depth : 1 blockIdx: 0,threadIdx: 3,parentblockIdx 10
+depth : 1 blockIdx: 0,threadIdx: 4,parentblockIdx 10
+depth : 1 blockIdx: 0,threadIdx: 5,parentblockIdx 10
+depth : 1 blockIdx: 0,threadIdx: 6,parentblockIdx 10
+depth : 1 blockIdx: 0,threadIdx: 7,parentblockIdx 10
+depth : 1 blockIdx: 0,threadIdx: 8,parentblockIdx 10
+depth : 1 blockIdx: 0,threadIdx: 9,parentblockIdx 10
+```
+
+输出终端中先看到这些nested execution depth:消息，然后才看到深度1的线程打印，这可能是由于CUDA printf缓冲机制造成的，实际是父线程在子网格执行结束后才执行的，隐式同步等待下一步执行
+
+输出的编号从0-31乱序 可见各个块之间是并行的，同一个父网格下的线程打印连续，可见同意祖宗下的子网格是同步的。
+
+**执行过程中**
+
+```
+nvcc -arch=sm_75 nested_Hello_World.cu -o nested_Hello_World -lcudadevrt --relocatable-device-code true //正常执行
+nvcc -arch=sm_75 -dc nested_Hello_World.cu -o nested_Hello_World //运行时，显示文件权限寿险
+```
