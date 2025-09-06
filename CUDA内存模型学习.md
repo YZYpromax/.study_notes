@@ -1,6 +1,8 @@
 # CUDA内存模型学习
 
-## GPU内存设备
+## 内存模型概述
+
+### GPU内存设备
 
 Registers
 Shared memory
@@ -51,7 +53,7 @@ minBlocksPerMultiprocessor：可选参数，每个SM中预期的最小的常驻�
 
 **全局内存：**即设备内存（硬件角度），全局内存访问是对齐，也就是一次要读取指定大小（32，64，128）整数倍字节的内存，实际中内存对齐的存储方式，可能会导致无用信息的读取，降低效率
 
-## 静态内存分配
+### 静态内存分配
 
 静态内存分配：
 
@@ -69,4 +71,53 @@ float *d_ptr =Null;
 float value =3.14f;
 cudaGetSymbolAddress((void**)&d_ptr,Devdata);
 cudaMemcpy(d_ptr,&value,sizeof(flost),cudaMemcpyHostToDevice);
+```
+
+## 内存管理
+
+### 内存的申请、初始化与释放：
+
+```
+float *devPtr=NULL;
+cudaMalloc((void**)&devPtr,size_t count); //申请  &devPtr= float**  取地址 其实就是指针 
+cudaMemset(void *devPtr,int value,size_t count);//初始化
+//int value 是将目标区域的每个字节  填充为value的值   size_t count 也是字节数
+cudaFree(*devPtr);//释放
+```
+
+size_t 可移植性更强 比int   unsigned int.
+
+### 数据的显示传输：
+
+```
+cudaMemcpy(void *dst,const void * src,size_t count,enum cudaMemcpyKind kind)
+```
+
+Pcle和GPU内存带宽差距大，尽量减少设备和主机内存传输
+
+### 固定内存：
+
+申请： `cudaMallochost((void**)devptr,size_t count);`
+
+释放：cudaHostFree(void*devptr);
+
+固定内存可以直接传输到设备虽然分配和释放成本高 但是传输速率远远优于分页内存
+
+### 零拷贝内存：
+
+首先是固定内存，该内存在主机端，设备可以通过这块内存在主机端的指针 `**pDevice`访问数据，数据通过Pcle总线在主机和设备端传输。
+
+```
+cudaHostAlloc(void ** pHost,size_t count,unsigned int flags)
+```
+
+| 参数                       | 功能                                 |
+| -------------------------- | ------------------------------------ |
+| cudaHostAllocDefalt        | cudaMallocHost                       |
+| cudaHostAllocPortable      | 返回能被所有CUDA上下文使用的固定内存 |
+| cudaHostAllocWriteCombined | 写结合内存                           |
+| cudaHostAllocMapped        | 零拷贝                               |
+
+```
+cudaError_t cudaHostGetDevicePointer(void ** pDevice,void * pHost,unsigned flags) //flag=0
 ```
